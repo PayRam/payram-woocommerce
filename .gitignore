@@ -1,0 +1,14 @@
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
+
+# Local WordPress dev env (wp-env)
+.wp-env-home/
+
+# Build / dependency artifacts
+node_modules/
+vendor/
+
+# Compiled translations (generated from .po)
+languages/*.mo

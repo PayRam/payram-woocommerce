@@ -1,0 +1,211 @@
+<?php
+/**
+ * Plugin Name: PayRam for WooCommerce
+ * Description: Accept crypto payments in WooCommerce via a self-hosted PayRam instance.
+ * Version:     0.2.0
+ * Author:      PayRam
+ * Text Domain: payram-woocommerce
+ * Domain Path: /languages
+ * Requires PHP: 7.4
+ * WC requires at least: 6.0
+ *
+ * This plugin is a BRIDGE: it does not run PayRam. Point it at an existing,
+ * already-running PayRam instance (URL + project API key). PayRam handles all
+ * crypto/wallet logic; WooCommerce just creates a payment, redirects the buyer
+ * to PayRam's hosted checkout, and reacts to PayRam's webhook.
+ */
+
+if ( ! defined( 'ABSPATH' ) ) {
+	exit; // no direct access
+}
+
+define( 'PAYRAM_WC_VERSION', '0.2.0' );
+define( 'PAYRAM_WC_PLUGIN_FILE', __FILE__ );
+
+/**
+ * Declare High-Performance Order Storage (custom order tables) compatibility.
+ * The plugin only uses WooCommerce CRUD APIs, so it is HPOS-safe.
+ */
+add_action( 'before_woocommerce_init', function () {
+	if ( class_exists( '\Automattic\WooCommerce\Utilities\FeaturesUtil' ) ) {
+		\Automattic\WooCommerce\Utilities\FeaturesUtil::declare_compatibility( 'custom_order_tables', __FILE__, true );
+	}
+} );
+
+/** Load translations. */
+add_action( 'init', function () {
+	load_plugin_textdomain( 'payram-woocommerce', false, dirname( plugin_basename( __FILE__ ) ) . '/languages' );
+} );
+
+/**
+ * Register the gateway with WooCommerce (only if WooCommerce is active).
+ */
+add_action( 'plugins_loaded', function () {
+	if ( ! class_exists( 'WC_Payment_Gateway' ) ) {
+		add_action( 'admin_notices', function () {
+			echo '<div class="notice notice-error"><p>' . esc_html__( 'PayRam for WooCommerce requires WooCommerce to be installed and active.', 'payram-woocommerce' ) . '</p></div>';
+		} );
+		return;
+	}
+
+	require_once __DIR__ . '/includes/class-wc-gateway-payram.php';
+
+	add_filter( 'woocommerce_payment_gateways', function ( $gateways ) {
+		$gateways[] = 'WC_Gateway_PayRam';
+		return $gateways;
+	} );
+} );
+
+/**
+ * Register the gateway with the WooCommerce Cart/Checkout BLOCKS so it appears
+ * on the modern (block-based) checkout, not only the classic shortcode one.
+ */
+add_action( 'woocommerce_blocks_loaded', function () {
+	if ( ! class_exists( '\Automattic\WooCommerce\Blocks\Payments\Integrations\AbstractPaymentMethodType' ) ) {
+		return;
+	}
+	require_once __DIR__ . '/includes/class-wc-gateway-payram-blocks.php';
+	add_action( 'woocommerce_blocks_payment_method_type_registration', function ( $registry ) {
+		$registry->register( new WC_Gateway_PayRam_Blocks() );
+	} );
+} );
+
+/**
+ * Register the webhook receiver REST route: POST /wp-json/payram/v1/webhook
+ * PayRam calls this when a payment's state changes.
+ */
+add_action( 'rest_api_init', function () {
+	register_rest_route( 'payram/v1', '/webhook', array(
+		'methods'             => 'POST',
+		'callback'            => 'payram_wc_handle_webhook',
+		'permission_callback' => '__return_true', // auth is checked inside (API key and/or HMAC)
+	) );
+} );
+
+/**
+ * Buyer-return handler. Point your PayRam project's Success/Cancel URL at:
+ *   https://your-store.com/?payram_return=1
+ * PayRam's hosted checkout appends &reference_id=…&invoice_id=… on redirect,
+ * and we forward the buyer to the matching order's "order received" page.
+ */
+add_action( 'template_redirect', function () {
+	if ( empty( $_GET['payram_return'] ) ) {
+		return;
+	}
+	$invoice_id   = isset( $_GET['invoice_id'] ) ? sanitize_text_field( wp_unslash( $_GET['invoice_id'] ) ) : '';
+	$reference_id = isset( $_GET['reference_id'] ) ? sanitize_text_field( wp_unslash( $_GET['reference_id'] ) ) : '';
+
+	$order = $invoice_id ? wc_get_order( $invoice_id ) : false;
+	if ( ! $order && $reference_id ) {
+		$order = payram_wc_find_order_by_reference( $reference_id );
+	}
+
+	$url = $order ? $order->get_checkout_order_received_url() : wc_get_page_permalink( 'myaccount' );
+	wp_safe_redirect( $url );
+	exit;
+} );
+
+/**
+ * Webhook handler. PayRam payload (see core utils.go):
+ *   { customer_id, invoice_id, reference_id, status, amount, currency,
+ *     filled_amount, filled_amount_in_usd, timestamp, ... }
+ * status ∈ OPEN | PARTIALLY_FILLED | FILLED | OVER_FILLED | CANCELLED
+ *
+ * Auth (either is accepted, for backward compatibility):
+ *   - "API-Key" header equal to the project API key (legacy), OR
+ *   - "X-Payram-Signature: sha256=<hex>" = HMAC-SHA256(raw body, project API key).
+ */
+function payram_wc_handle_webhook( WP_REST_Request $request ) {
+	$gateway = payram_wc_get_gateway();
+	if ( ! $gateway ) {
+		return new WP_REST_Response( array( 'error' => 'gateway not configured' ), 500 );
+	}
+
+	// 1. Authenticate: API-Key header OR HMAC signature.
+	$raw      = $request->get_body();
+	$sent_key = (string) $request->get_header( 'api_key' );          // "API-Key" -> "api_key"
+	$sent_sig = (string) $request->get_header( 'x_payram_signature' ); // "X-Payram-Signature"
+
+	$key_ok = $sent_key !== '' && hash_equals( (string) $gateway->api_key, $sent_key );
+	$sig_ok = false;
+	if ( $sent_sig !== '' && strpos( $sent_sig, 'sha256=' ) === 0 ) {
+		$expected = 'sha256=' . hash_hmac( 'sha256', $raw, (string) $gateway->api_key );
+		$sig_ok   = hash_equals( $expected, $sent_sig );
+	}
+	if ( ! $key_ok && ! $sig_ok ) {
+		$gateway->log( 'Webhook rejected: neither API-Key nor HMAC signature valid' );
+		return new WP_REST_Response( array( 'error' => 'unauthorised' ), 401 );
+	}
+
+	$body         = $request->get_json_params();
+	$invoice_id   = isset( $body['invoice_id'] ) ? $body['invoice_id'] : '';
+	$reference_id = isset( $body['reference_id'] ) ? $body['reference_id'] : '';
+	$status       = isset( $body['status'] ) ? strtoupper( (string) $body['status'] ) : '';
+	$gateway->log( 'Webhook received (' . ( $sig_ok ? 'hmac' : 'api-key' ) . '): ' . wp_json_encode( $body ) );
+
+	// 2. Find the order (invoice_id == WooCommerce order id).
+	$order = $invoice_id ? wc_get_order( $invoice_id ) : false;
+	if ( ! $order && $reference_id ) {
+		$order = payram_wc_find_order_by_reference( $reference_id );
+	}
+	if ( ! $order ) {
+		$gateway->log( 'Webhook: no matching order for invoice_id=' . $invoice_id . ' reference_id=' . $reference_id );
+		return new WP_REST_Response( array( 'error' => 'order not found' ), 404 );
+	}
+
+	// 3. Defence-in-depth: re-verify with PayRam.
+	$verified = $gateway->fetch_payment_status( $reference_id );
+	if ( is_array( $verified ) && isset( $verified['status'] ) ) {
+		$status = strtoupper( (string) $verified['status'] );
+		$gateway->log( 'Webhook: re-verified status=' . $status );
+	}
+
+	// 4. Idempotency — if already paid, ack and stop.
+	if ( $order->is_paid() ) {
+		return new WP_REST_Response( array( 'received' => true, 'note' => 'already paid' ), 200 );
+	}
+
+	// 5. Map PayRam state -> WooCommerce.
+	switch ( $status ) {
+		case 'FILLED':
+		case 'OVER_FILLED':
+			$order->payment_complete( $reference_id );
+			$order->add_order_note( sprintf(
+				/* translators: 1: PayRam payment state, 2: reference id */
+				__( 'PayRam: payment %1$s (ref %2$s)', 'payram-woocommerce' ),
+				$status,
+				$reference_id
+			) );
+			break;
+		case 'PARTIALLY_FILLED':
+			$order->update_status( 'on-hold', __( 'PayRam: partial payment received.', 'payram-woocommerce' ) );
+			break;
+		case 'CANCELLED':
+			$order->update_status( 'cancelled', __( 'PayRam: payment cancelled.', 'payram-woocommerce' ) );
+			break;
+		default: // OPEN / UNDEFINED — nothing to do yet
+			$gateway->log( 'Webhook: no-op for status=' . $status );
+			break;
+	}
+
+	return new WP_REST_Response( array( 'received' => true ), 200 );
+}
+
+/** Helper: get a configured instance of the gateway. */
+function payram_wc_get_gateway() {
+	if ( ! class_exists( 'WC_Gateway_PayRam' ) ) {
+		return null;
+	}
+	$gateways = WC()->payment_gateways() ? WC()->payment_gateways()->payment_gateways() : array();
+	return isset( $gateways['payram'] ) ? $gateways['payram'] : new WC_Gateway_PayRam();
+}
+
+/** Helper: locate an order by stored PayRam reference id. */
+function payram_wc_find_order_by_reference( $reference_id ) {
+	$orders = wc_get_orders( array(
+		'limit'      => 1,
+		'meta_key'   => '_payram_reference_id',
+		'meta_value' => $reference_id,
+	) );
+	return ! empty( $orders ) ? $orders[0] : false;
+}
