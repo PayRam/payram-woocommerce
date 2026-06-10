@@ -25,8 +25,10 @@ hosted crypto checkout, and completes the order when PayRam reports payment.
            body { customerEmail, customerID, amountInUSD, invoiceID }
            -> { url, reference_id, host }
 - Verify:  GET  {payram_url}/api/v1/payment/reference/{reference_id}
-- Webhook: PayRam POSTs { invoice_id, reference_id, status, ... } with the
-           API-Key header. status: OPEN|PARTIALLY_FILLED|FILLED|OVER_FILLED|CANCELLED
+- Webhook: PayRam POSTs { invoice_id, reference_id, status, ... } with an
+           X-Payram-Signature header (sha256= HMAC-SHA256 of the raw body,
+           keyed by the project API key).
+           status: OPEN|PARTIALLY_FILLED|FILLED|OVER_FILLED|CANCELLED
 
 == Changelog ==
 = 0.1.0 =

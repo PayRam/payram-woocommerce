@@ -78,7 +78,7 @@ add_action( 'rest_api_init', function () {
 	register_rest_route( 'payram/v1', '/webhook', array(
 		'methods'             => 'POST',
 		'callback'            => 'payram_wc_handle_webhook',
-		'permission_callback' => '__return_true', // auth is checked inside (API key and/or HMAC)
+		'permission_callback' => '__return_true', // auth is checked inside (HMAC signature)
 	) );
 } );
 
@@ -111,8 +111,7 @@ add_action( 'template_redirect', function () {
  *     filled_amount, filled_amount_in_usd, timestamp, ... }
  * status ∈ OPEN | PARTIALLY_FILLED | FILLED | OVER_FILLED | CANCELLED
  *
- * Auth (either is accepted, for backward compatibility):
- *   - "API-Key" header equal to the project API key (legacy), OR
+ * Auth:
  *   - "X-Payram-Signature: sha256=<hex>" = HMAC-SHA256(raw body, project API key).
  */
 function payram_wc_handle_webhook( WP_REST_Request $request ) {
@@ -121,19 +120,17 @@ function payram_wc_handle_webhook( WP_REST_Request $request ) {
 		return new WP_REST_Response( array( 'error' => 'gateway not configured' ), 500 );
 	}
 
-	// 1. Authenticate: API-Key header OR HMAC signature.
+	// 1. Authenticate: HMAC signature over the raw body.
 	$raw      = $request->get_body();
-	$sent_key = (string) $request->get_header( 'api_key' );          // "API-Key" -> "api_key"
 	$sent_sig = (string) $request->get_header( 'x_payram_signature' ); // "X-Payram-Signature"
 
-	$key_ok = $sent_key !== '' && hash_equals( (string) $gateway->api_key, $sent_key );
 	$sig_ok = false;
 	if ( $sent_sig !== '' && strpos( $sent_sig, 'sha256=' ) === 0 ) {
 		$expected = 'sha256=' . hash_hmac( 'sha256', $raw, (string) $gateway->api_key );
 		$sig_ok   = hash_equals( $expected, $sent_sig );
 	}
-	if ( ! $key_ok && ! $sig_ok ) {
-		$gateway->log( 'Webhook rejected: neither API-Key nor HMAC signature valid' );
+	if ( ! $sig_ok ) {
+		$gateway->log( 'Webhook rejected: missing or invalid HMAC signature' );
 		return new WP_REST_Response( array( 'error' => 'unauthorised' ), 401 );
 	}
 
@@ -141,7 +138,7 @@ function payram_wc_handle_webhook( WP_REST_Request $request ) {
 	$invoice_id   = isset( $body['invoice_id'] ) ? $body['invoice_id'] : '';
 	$reference_id = isset( $body['reference_id'] ) ? $body['reference_id'] : '';
 	$status       = isset( $body['status'] ) ? strtoupper( (string) $body['status'] ) : '';
-	$gateway->log( 'Webhook received (' . ( $sig_ok ? 'hmac' : 'api-key' ) . '): ' . wp_json_encode( $body ) );
+	$gateway->log( 'Webhook received (hmac): ' . wp_json_encode( $body ) );
 
 	// 2. Find the order (invoice_id == WooCommerce order id).
 	$order = $invoice_id ? wc_get_order( $invoice_id ) : false;
