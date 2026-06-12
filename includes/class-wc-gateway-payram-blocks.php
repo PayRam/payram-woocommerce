@@ -41,7 +41,7 @@ final class WC_Gateway_PayRam_Blocks extends AbstractPaymentMethodType {
 
 	public function get_payment_method_data() {
 		return array(
-			'title'       => isset( $this->settings['title'] ) ? $this->settings['title'] : 'Pay with Crypto (PayRam)',
+			'title'       => isset( $this->settings['title'] ) ? $this->settings['title'] : 'PayRam',
 			'description' => isset( $this->settings['description'] ) ? $this->settings['description'] : '',
 			'supports'    => array( 'products' ),
 		);

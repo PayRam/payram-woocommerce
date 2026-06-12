@@ -10,7 +10,7 @@
 	const { registerPaymentMethod } = registry;
 	const { createElement } = element;
 	const settings = settingsApi.getSetting( 'payram_data', {} );
-	const label = settings.title || 'Pay with Crypto (PayRam)';
+	const label = settings.title || 'PayRam';
 
 	const Content = function () {
 		return createElement( 'div', null, settings.description || '' );

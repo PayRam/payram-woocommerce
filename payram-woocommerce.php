@@ -2,7 +2,7 @@
 /**
  * Plugin Name: PayRam for WooCommerce
  * Description: Accept crypto payments in WooCommerce via a self-hosted PayRam instance.
- * Version:     0.2.0
+ * Version:     0.3.0
  * Author:      PayRam
  * Text Domain: payram-woocommerce
  * Domain Path: /languages
@@ -19,7 +19,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 	exit; // no direct access
 }
 
-define( 'PAYRAM_WC_VERSION', '0.2.0' );
+define( 'PAYRAM_WC_VERSION', '0.3.0' );
 define( 'PAYRAM_WC_PLUGIN_FILE', __FILE__ );
 
 /**
