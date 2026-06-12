@@ -29,6 +29,7 @@ class WC_Gateway_PayRam extends WC_Payment_Gateway {
 		$this->method_title       = 'PayRam (Crypto)';
 		$this->method_description = 'Accept crypto via a self-hosted PayRam instance.';
 		$this->has_fields         = false;
+		$this->icon               = plugins_url( 'assets/images/payram-icon.png', PAYRAM_WC_PLUGIN_FILE );
 
 		$this->init_form_fields();
 		$this->init_settings();
@@ -58,13 +59,13 @@ class WC_Gateway_PayRam extends WC_Payment_Gateway {
 				'title'       => 'Title',
 				'type'        => 'text',
 				'description' => 'Shown to the customer at checkout.',
-				'default'     => 'Pay with Crypto (PayRam)',
+				'default'     => 'PayRam',
 				'desc_tip'    => true,
 			),
 			'description' => array(
 				'title'   => 'Description',
 				'type'    => 'textarea',
-				'default' => 'Pay with Bitcoin, Ethereum and more via PayRam.',
+				'default' => 'Accept crypto payments on your store',
 			),
 			'payram_url'  => array(
 				'title'       => 'PayRam URL',
