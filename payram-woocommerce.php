@@ -150,12 +150,30 @@ function payram_wc_handle_webhook( WP_REST_Request $request ) {
 		return new WP_REST_Response( array( 'error' => 'order not found' ), 404 );
 	}
 
-	// 3. Defence-in-depth: re-verify with PayRam.
-	$verified = $gateway->fetch_payment_status( $reference_id );
-	if ( is_array( $verified ) && isset( $verified['status'] ) ) {
-		$status = strtoupper( (string) $verified['status'] );
-		$gateway->log( 'Webhook: re-verified status=' . $status );
+	// 3. Defence-in-depth: re-verify with PayRam. The verify endpoint
+	// (GET /payment/reference/{id}) reports the state under `paymentState`,
+	// using the same vocabulary as the webhook `status` (FILLED,
+	// PARTIALLY_FILLED, OVER_FILLED, OPEN, CANCELLED). Prefer it; fall back to
+	// `status` for older cores. FAIL CLOSED: if PayRam is unreachable or
+	// returns no usable state, answer 503 — PayRam's webhook delivery retries
+	// (quick retries + long-term delivery log), so the order is updated on a
+	// later attempt. The signed webhook body alone is never trusted for order
+	// transitions (a replayed old-but-validly-signed body would otherwise pass).
+	$verified       = $gateway->fetch_payment_status( $reference_id );
+	$verified_state = '';
+	if ( is_array( $verified ) ) {
+		if ( isset( $verified['paymentState'] ) ) {
+			$verified_state = (string) $verified['paymentState'];
+		} elseif ( isset( $verified['status'] ) ) {
+			$verified_state = (string) $verified['status'];
+		}
 	}
+	if ( '' === $verified_state ) {
+		$gateway->log( 'Webhook: could not re-verify reference ' . $reference_id . ' with PayRam - asking for redelivery (503)' );
+		return new WP_REST_Response( array( 'error' => 'verification unavailable, retry later' ), 503 );
+	}
+	$status = strtoupper( $verified_state );
+	$gateway->log( 'Webhook: re-verified paymentState=' . $status );
 
 	// 4. Idempotency — if already paid, ack and stop.
 	if ( $order->is_paid() ) {
