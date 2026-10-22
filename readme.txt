@@ -1,6 +1,7 @@
 === PayRam for WooCommerce ===
 Contributors: payram
 Requires at least: 6.0 (WordPress), WooCommerce 6.0
+Tested up to: 7.1
 Requires PHP: 7.4
 Stable tag: 0.1.0
 

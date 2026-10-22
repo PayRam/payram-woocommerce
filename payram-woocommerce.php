@@ -8,6 +8,7 @@
  * Domain Path: /languages
  * Requires PHP: 7.4
  * WC requires at least: 6.0
+ * WC tested up to: 11.2
  *
  * This plugin is a BRIDGE: it does not run PayRam. Point it at an existing,
  * already-running PayRam instance (URL + project API key). PayRam handles all
