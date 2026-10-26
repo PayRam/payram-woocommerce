@@ -124,7 +124,14 @@ function payram_wc_handle_webhook( WP_REST_Request $request ) {
 		return new WP_REST_Response( array( 'error' => 'gateway not configured' ), 500 );
 	}
 
-	// 1. Authenticate: HMAC signature over the raw body.
+	// 1. Authenticate: HMAC signature over the raw body. With no API key set
+	// there is nothing to check against (anyone can compute an HMAC keyed by
+	// an empty string), so every webhook is refused. 503 makes PayRam keep
+	// redelivering, so payments made meanwhile still land once the key is set.
+	if ( '' === (string) $gateway->api_key ) {
+		$gateway->log( 'Webhook refused: no PayRam API key is set, so its signature cannot be checked. Set the project API key in WooCommerce > Settings > Payments > PayRam; PayRam keeps redelivering until then.', 'error' );
+		return new WP_REST_Response( array( 'error' => 'api key not configured' ), 503 );
+	}
 	$raw      = $request->get_body();
 	$sent_sig = (string) $request->get_header( 'x_payram_signature' ); // "X-Payram-Signature"
 
