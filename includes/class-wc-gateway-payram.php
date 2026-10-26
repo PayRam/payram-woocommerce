@@ -8,7 +8,8 @@
  *    returns { url, reference_id, host }. We redirect the buyer to `url`
  *    (PayRam's hosted checkout) and remember reference_id on the order.
  *  - The webhook receiver (in the main plugin file) completes the order when
- *    PayRam reports the payment FILLED.
+ *    PayRam reports THIS order's payment (the saved reference_id) FILLED and
+ *    the amount paid covers the order total.
  */
 
 if ( ! defined( 'ABSPATH' ) ) {
@@ -118,11 +119,9 @@ class WC_Gateway_PayRam extends WC_Payment_Gateway {
 			wc_add_notice( __( 'Could not fetch an exchange rate right now. Please try again.', 'payram-woocommerce' ), 'error' );
 			return array( 'result' => 'failure' );
 		}
-		$customer_id = $order->get_customer_id() ? (string) $order->get_customer_id() : (string) $order_id;
-
 		$payload = array(
 			'customerEmail' => $order->get_billing_email(),
-			'customerID'    => $customer_id,
+			'customerID'    => $this->get_payram_customer_id( $order ),
 			'amountInUSD'   => $amount_usd,
 			'invoiceID'     => (string) $order_id,
 		);
@@ -146,16 +145,25 @@ class WC_Gateway_PayRam extends WC_Payment_Gateway {
 		$body = json_decode( wp_remote_retrieve_body( $response ), true );
 		$this->log( 'create payment response (' . $code . '): ' . wp_remote_retrieve_body( $response ) );
 
-		if ( $code < 200 || $code >= 300 || empty( $body['url'] ) ) {
+		$reference_id = ( is_array( $body ) && isset( $body['reference_id'] ) && is_string( $body['reference_id'] ) )
+			? sanitize_text_field( $body['reference_id'] )
+			: '';
+		if ( $code < 200 || $code >= 300 || empty( $body['url'] ) || '' === $reference_id ) {
+			$this->log( 'create payment failed for order ' . $order_id . ': HTTP ' . $code . ( '' === $reference_id ? ', no reference_id returned' : '' ), 'error' );
 			wc_add_notice( 'PayRam could not create the payment. Please try again.', 'error' );
 			return array( 'result' => 'failure' );
 		}
 
-		// Remember the reference so the webhook can match this order.
-		if ( ! empty( $body['reference_id'] ) ) {
-			$order->update_meta_data( '_payram_reference_id', sanitize_text_field( $body['reference_id'] ) );
-		}
+		// The webhook acts only on this reference for this order. A new
+		// checkout for the same order (the buyer pays again) replaces it; the
+		// note keeps every reference the order was given visible to the merchant.
+		$order->update_meta_data( '_payram_reference_id', $reference_id );
 		$order->update_status( 'pending', __( 'Awaiting PayRam crypto payment.', 'payram-woocommerce' ) );
+		$order->add_order_note( sprintf(
+			/* translators: %s: PayRam reference id */
+			__( 'PayRam checkout created (ref %s).', 'payram-woocommerce' ),
+			$reference_id
+		) );
 		$order->save();
 
 		// Empty the cart and redirect to PayRam's hosted checkout.
@@ -170,8 +178,20 @@ class WC_Gateway_PayRam extends WC_Payment_Gateway {
 	}
 
 	/**
-	 * Re-verify a payment's state directly with PayRam (defence-in-depth, since
-	 * the webhook is unsigned). Returns the decoded body, or null on failure.
+	 * The customerID this plugin sends PayRam for an order: the WooCommerce
+	 * customer id, or the order id for a guest. The webhook compares it with
+	 * what PayRam reports for an order that has no saved reference.
+	 */
+	public function get_payram_customer_id( $order ) {
+		return $order->get_customer_id() ? (string) $order->get_customer_id() : (string) $order->get_id();
+	}
+
+	/**
+	 * Read a payment straight from PayRam, so the webhook acts on PayRam's
+	 * record rather than on the webhook body (a validly signed body can be
+	 * old, or belong to another payment). Returns the decoded body
+	 * ({ paymentState, invoiceID, customerID, amountInUSD, filledAmountInUSD,
+	 * ... }), or null when PayRam is unreachable or does not answer 2xx.
 	 * GET {payram_url}/api/v1/payment/reference/{reference_id}
 	 */
 	public function fetch_payment_status( $reference_id ) {
@@ -183,11 +203,63 @@ class WC_Gateway_PayRam extends WC_Payment_Gateway {
 			'headers' => array( 'API-Key' => $this->api_key ),
 		) );
 		if ( is_wp_error( $response ) ) {
-			$this->log( 'verify error: ' . $response->get_error_message() );
+			$this->log( 'verify error: ' . $response->get_error_message(), 'warning' );
+			return null;
+		}
+		$code = (int) wp_remote_retrieve_response_code( $response );
+		if ( $code < 200 || $code >= 300 ) {
+			$this->log( 'verify error: PayRam answered HTTP ' . $code . ' for reference ' . $reference_id, 'warning' );
 			return null;
 		}
 		$body = json_decode( wp_remote_retrieve_body( $response ), true );
 		return is_array( $body ) ? $body : null;
+	}
+
+	/**
+	 * The order's current total in US cents, to check against what PayRam
+	 * reports as paid. A USD order uses its total as is. Another currency uses
+	 * the rate saved when its PayRam checkout was created, never a live rate,
+	 * so a rate move after checkout cannot hold a fully paid order. Null when
+	 * it cannot be worked out (no saved rate, or the order changed currency).
+	 */
+	public function get_order_total_usd_cents( $order ) {
+		$currency = strtoupper( (string) $order->get_currency() );
+		if ( 'USD' === $currency ) {
+			return self::usd_to_cents( $order->get_total() );
+		}
+		$usd_per_unit = (float) $order->get_meta( '_payram_fx_rate' );
+		if ( $usd_per_unit <= 0 || strtoupper( (string) $order->get_meta( '_payram_store_currency' ) ) !== $currency ) {
+			return null;
+		}
+		return self::usd_to_cents( sprintf( '%.2F', $this->convert_to_usd( $order->get_total(), $usd_per_unit ) ) );
+	}
+
+	/**
+	 * A USD amount as whole cents, the third decimal rounded half up (PayRam
+	 * reports amounts as decimal strings with up to 18 places). Works on the
+	 * digits, not on floats. Null for anything that is not a plain
+	 * non-negative amount.
+	 */
+	public static function usd_to_cents( $amount ) {
+		if ( is_int( $amount ) ) {
+			$amount = (string) $amount;
+		} elseif ( is_float( $amount ) ) {
+			$amount = sprintf( '%.6F', $amount );
+		}
+		if ( ! is_string( $amount ) || ! preg_match( '/^(\d{1,15})(?:\.(\d+))?$/', trim( $amount ), $parts ) ) {
+			return null;
+		}
+		$fraction = isset( $parts[2] ) ? $parts[2] : '';
+		$cents    = (int) $parts[1] * 100 + (int) substr( str_pad( $fraction, 2, '0' ), 0, 2 );
+		if ( strlen( $fraction ) > 2 && (int) $fraction[2] >= 5 ) {
+			$cents++;
+		}
+		return $cents;
+	}
+
+	/** Whole cents as a "12.34" string, for notes and logs. */
+	public static function format_cents( $cents ) {
+		return sprintf( '%d.%02d', intdiv( $cents, 100 ), $cents % 100 );
 	}
 
 	/**
@@ -204,11 +276,16 @@ class WC_Gateway_PayRam extends WC_Payment_Gateway {
 			$this->log( 'FX: no rate for ' . $currency );
 			return null;
 		}
-		$usd = round( (float) $amount * $usd_per_unit, 2 );
+		$usd = $this->convert_to_usd( $amount, $usd_per_unit );
 		$order->update_meta_data( '_payram_store_currency', $currency );
 		$order->update_meta_data( '_payram_fx_rate', $usd_per_unit );
 		$order->update_meta_data( '_payram_amount_usd', $usd );
 		return $usd;
+	}
+
+	/** USD for an amount at a given rate, rounded to cents as sent to PayRam. */
+	private function convert_to_usd( $amount, $usd_per_unit ) {
+		return round( (float) $amount * $usd_per_unit, 2 );
 	}
 
 	/** USD value of 1 unit of $currency, cached for an hour. Null on failure. */
@@ -234,13 +311,18 @@ class WC_Gateway_PayRam extends WC_Payment_Gateway {
 		return $usd_per_unit;
 	}
 
-	/** Lightweight logger gated by the debug setting. */
-	public function log( $message ) {
-		if ( ! $this->debug ) {
+	/**
+	 * Log to WooCommerce > Status > Logs (source "payram"). Routine traffic
+	 * ('info') is written only with debug logging on; refusals and failures
+	 * ('warning', 'error') are always written, so a merchant can see why an
+	 * order did not change without turning debug on first.
+	 */
+	public function log( $message, $level = 'info' ) {
+		if ( 'info' === $level && ! $this->debug ) {
 			return;
 		}
 		if ( function_exists( 'wc_get_logger' ) ) {
-			wc_get_logger()->info( $message, array( 'source' => 'payram' ) );
+			wc_get_logger()->log( $level, $message, array( 'source' => 'payram' ) );
 		}
 	}
 }
