@@ -2,7 +2,7 @@
 /**
  * Plugin Name: PayRam for WooCommerce
  * Description: Accept crypto payments in WooCommerce via a self-hosted PayRam instance.
- * Version:     0.3.1
+ * Version:     0.3.2
  * Author:      PayRam
  * Text Domain: payram-woocommerce
  * Requires PHP: 7.4
@@ -19,7 +19,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 	exit; // no direct access
 }
 
-define( 'PAYRAM_WC_VERSION', '0.3.1' );
+define( 'PAYRAM_WC_VERSION', '0.3.2' );
 define( 'PAYRAM_WC_PLUGIN_FILE', __FILE__ );
 
 /**
@@ -95,10 +95,7 @@ add_action( 'template_redirect', function () {
 	$invoice_id   = isset( $_GET['invoice_id'] ) ? sanitize_text_field( wp_unslash( $_GET['invoice_id'] ) ) : '';
 	$reference_id = isset( $_GET['reference_id'] ) ? sanitize_text_field( wp_unslash( $_GET['reference_id'] ) ) : '';
 
-	$order = $invoice_id ? wc_get_order( $invoice_id ) : false;
-	if ( ! $order && $reference_id ) {
-		$order = payram_wc_find_order_by_reference( $reference_id );
-	}
+	$order = payram_wc_find_order( $invoice_id, $reference_id );
 
 	$url = $order ? $order->get_checkout_order_received_url() : wc_get_page_permalink( 'myaccount' );
 	wp_safe_redirect( $url );
@@ -113,6 +110,13 @@ add_action( 'template_redirect', function () {
  *
  * Auth:
  *   - "X-Payram-Signature: sha256=<hex>" = HMAC-SHA256(raw body, project API key).
+ *
+ * A valid signature proves the webhook came from the PayRam project, not that
+ * it is about this order: every store registered on the project receives every
+ * payment's webhook, and an order's total can change after its checkout was
+ * created. So the order changes only when the webhook's reference is the one
+ * this order's checkout was given, and PayRam's own record of that payment
+ * (not the webhook body) says it is paid in full.
  */
 function payram_wc_handle_webhook( WP_REST_Request $request ) {
 	$gateway = payram_wc_get_gateway();
@@ -120,7 +124,14 @@ function payram_wc_handle_webhook( WP_REST_Request $request ) {
 		return new WP_REST_Response( array( 'error' => 'gateway not configured' ), 500 );
 	}
 
-	// 1. Authenticate: HMAC signature over the raw body.
+	// 1. Authenticate: HMAC signature over the raw body. With no API key set
+	// there is nothing to check against (anyone can compute an HMAC keyed by
+	// an empty string), so every webhook is refused. 503 makes PayRam keep
+	// redelivering, so payments made meanwhile still land once the key is set.
+	if ( '' === (string) $gateway->api_key ) {
+		$gateway->log( 'Webhook refused: no PayRam API key is set, so its signature cannot be checked. Set the project API key in WooCommerce > Settings > Payments > PayRam; PayRam keeps redelivering until then.', 'error' );
+		return new WP_REST_Response( array( 'error' => 'api key not configured' ), 503 );
+	}
 	$raw      = $request->get_body();
 	$sent_sig = (string) $request->get_header( 'x_payram_signature' ); // "X-Payram-Signature"
 
@@ -135,55 +146,112 @@ function payram_wc_handle_webhook( WP_REST_Request $request ) {
 	}
 
 	$body         = $request->get_json_params();
-	$invoice_id   = isset( $body['invoice_id'] ) ? $body['invoice_id'] : '';
-	$reference_id = isset( $body['reference_id'] ) ? $body['reference_id'] : '';
-	$status       = isset( $body['status'] ) ? strtoupper( (string) $body['status'] ) : '';
+	$invoice_id   = isset( $body['invoice_id'] ) && is_scalar( $body['invoice_id'] ) ? (string) $body['invoice_id'] : '';
+	$reference_id = isset( $body['reference_id'] ) && is_scalar( $body['reference_id'] ) ? (string) $body['reference_id'] : '';
 	$gateway->log( 'Webhook received (hmac): ' . wp_json_encode( $body ) );
+	if ( '' === $reference_id ) {
+		$gateway->log( 'Webhook refused: signed body has no reference_id (invoice_id=' . $invoice_id . ')', 'warning' );
+		return new WP_REST_Response( array( 'error' => 'reference_id missing' ), 400 );
+	}
 
 	// 2. Find the order (invoice_id == WooCommerce order id).
-	$order = $invoice_id ? wc_get_order( $invoice_id ) : false;
-	if ( ! $order && $reference_id ) {
-		$order = payram_wc_find_order_by_reference( $reference_id );
-	}
+	$order = payram_wc_find_order( $invoice_id, $reference_id );
 	if ( ! $order ) {
 		$gateway->log( 'Webhook: no matching order for invoice_id=' . $invoice_id . ' reference_id=' . $reference_id );
 		return new WP_REST_Response( array( 'error' => 'order not found' ), 404 );
 	}
 
-	// 3. Defence-in-depth: re-verify with PayRam. The verify endpoint
-	// (GET /payment/reference/{id}) reports the state under `paymentState`,
-	// using the same vocabulary as the webhook `status` (FILLED,
-	// PARTIALLY_FILLED, OVER_FILLED, OPEN, CANCELLED). Prefer it; fall back to
-	// `status` for older cores. FAIL CLOSED: if PayRam is unreachable or
-	// returns no usable state, answer 503 — PayRam's webhook delivery retries
-	// (quick retries + long-term delivery log), so the order is updated on a
-	// later attempt. The signed webhook body alone is never trusted for order
-	// transitions (a replayed old-but-validly-signed body would otherwise pass).
-	$verified       = $gateway->fetch_payment_status( $reference_id );
-	$verified_state = '';
-	if ( is_array( $verified ) ) {
-		if ( isset( $verified['paymentState'] ) ) {
-			$verified_state = (string) $verified['paymentState'];
-		} elseif ( isset( $verified['status'] ) ) {
-			$verified_state = (string) $verified['status'];
-		}
+	// 3. The webhook must be about THIS order's payment. An order whose
+	// checkout this plugin created carries the reference PayRam gave it; any
+	// other reference is someone else's payment (another store on the same
+	// project, an older checkout of this order) and changes nothing here.
+	$saved_reference = (string) $order->get_meta( '_payram_reference_id' );
+	if ( '' !== $saved_reference && $saved_reference !== $reference_id ) {
+		return payram_wc_ignore_webhook( $gateway, $order, $reference_id, sprintf(
+			/* translators: 1: reference id in the webhook, 2: reference id of this order's checkout */
+			__( 'It is for PayRam payment %1$s, but this order\'s PayRam checkout is %2$s.', 'payram-woocommerce' ),
+			$reference_id,
+			$saved_reference
+		) );
 	}
+	if ( '' === $saved_reference && 'payram' !== $order->get_payment_method() ) {
+		return payram_wc_ignore_webhook( $gateway, $order, $reference_id, sprintf(
+			/* translators: %s: reference id in the webhook */
+			__( 'It is for PayRam payment %s, but this order was not placed with PayRam.', 'payram-woocommerce' ),
+			$reference_id
+		) );
+	}
+
+	// 4. Re-verify with PayRam: act on PayRam's own record of the payment
+	// (state and amounts), never on the webhook body, which could be an old
+	// but validly signed delivery. FAIL CLOSED: if PayRam is unreachable or
+	// returns no usable state, answer 503 so PayRam redelivers later.
+	$verified       = $gateway->fetch_payment_status( $reference_id );
+	$verified_state = ( is_array( $verified ) && isset( $verified['paymentState'] ) && is_string( $verified['paymentState'] ) )
+		? $verified['paymentState']
+		: '';
 	if ( '' === $verified_state ) {
-		$gateway->log( 'Webhook: could not re-verify reference ' . $reference_id . ' with PayRam - asking for redelivery (503)' );
+		$gateway->log( 'Webhook: could not re-verify reference ' . $reference_id . ' with PayRam - asking for redelivery (503)', 'warning' );
 		return new WP_REST_Response( array( 'error' => 'verification unavailable, retry later' ), 503 );
 	}
 	$status = strtoupper( $verified_state );
 	$gateway->log( 'Webhook: re-verified paymentState=' . $status );
 
-	// 4. Idempotency — if already paid, ack and stop.
-	if ( $order->is_paid() ) {
+	// 5. An order with no saved reference (none of this plugin's checkouts
+	// should lack one) is matched on what PayRam recorded when the payment was
+	// created: this order's id as invoiceID and its customer as customerID.
+	if ( '' === $saved_reference ) {
+		$payram_invoice  = isset( $verified['invoiceID'] ) && is_scalar( $verified['invoiceID'] ) ? (string) $verified['invoiceID'] : '';
+		$payram_customer = isset( $verified['customerID'] ) && is_scalar( $verified['customerID'] ) ? (string) $verified['customerID'] : '';
+		if ( (string) $order->get_id() !== $payram_invoice || $gateway->get_payram_customer_id( $order ) !== $payram_customer ) {
+			return payram_wc_ignore_webhook( $gateway, $order, $reference_id, sprintf(
+				/* translators: 1: reference id, 2: PayRam invoice id, 3: PayRam customer id, 4: this order's id, 5: this order's customer id */
+				__( 'PayRam records payment %1$s for invoice "%2$s" and customer "%3$s"; this order is invoice "%4$s" for customer "%5$s".', 'payram-woocommerce' ),
+				$reference_id,
+				$payram_invoice,
+				$payram_customer,
+				(string) $order->get_id(),
+				$gateway->get_payram_customer_id( $order )
+			) );
+		}
+	}
+
+	// 6. Idempotency — if already paid, or this payment already completed the
+	// order once (its reference is the transaction id), ack and stop. The
+	// second check keeps a redelivered webhook from reopening an order the
+	// merchant cancelled after it was paid.
+	if ( $order->is_paid() || $order->get_transaction_id() === $reference_id ) {
 		return new WP_REST_Response( array( 'received' => true, 'note' => 'already paid' ), 200 );
 	}
 
-	// 5. Map PayRam state -> WooCommerce.
+	// 7. Map PayRam state -> WooCommerce.
 	switch ( $status ) {
 		case 'FILLED':
 		case 'OVER_FILLED':
+			// Complete only when what PayRam confirmed as paid covers the
+			// order's current total (it may have been raised after checkout).
+			$paid_cents = WC_Gateway_PayRam::usd_to_cents( isset( $verified['filledAmountInUSD'] ) ? $verified['filledAmountInUSD'] : null );
+			$due_cents  = $gateway->get_order_total_usd_cents( $order );
+			if ( null === $paid_cents || null === $due_cents || $paid_cents < $due_cents ) {
+				if ( null === $paid_cents ) {
+					/* translators: 1: PayRam payment state, 2: reference id */
+					$reason = sprintf( __( 'PayRam reports payment %2$s as %1$s but did not say how much was paid.', 'payram-woocommerce' ), $status, $reference_id );
+				} elseif ( null === $due_cents ) {
+					/* translators: 1: PayRam payment state, 2: reference id, 3: currency code */
+					$reason = sprintf( __( 'PayRam reports payment %2$s as %1$s, but this order\'s %3$s total could not be converted to USD (no exchange rate was saved at checkout).', 'payram-woocommerce' ), $status, $reference_id, $order->get_currency() );
+				} else {
+					/* translators: 1: PayRam payment state, 2: reference id, 3: USD paid, 4: order total in USD */
+					$reason = sprintf( __( 'PayRam reports payment %2$s as %1$s with %3$s USD paid, but the order total is %4$s USD.', 'payram-woocommerce' ), $status, $reference_id, WC_Gateway_PayRam::format_cents( $paid_cents ), WC_Gateway_PayRam::format_cents( $due_cents ) );
+				}
+				$gateway->log( 'Webhook: order ' . $order->get_id() . ' put on hold, not completed: ' . $reason, 'warning' );
+				$hold_note = $reason . ' ' . __( 'The order is on hold: check the payment in PayRam before shipping.', 'payram-woocommerce' );
+				if ( $order->has_status( 'on-hold' ) ) {
+					$order->add_order_note( $hold_note ); // update_status() adds no note when the status does not change
+				} else {
+					$order->update_status( 'on-hold', $hold_note );
+				}
+				break;
+			}
 			$order->payment_complete( $reference_id );
 			$order->add_order_note( sprintf(
 				/* translators: 1: PayRam payment state, 2: reference id */
@@ -213,6 +281,33 @@ function payram_wc_get_gateway() {
 	}
 	$gateways = WC()->payment_gateways() ? WC()->payment_gateways()->payment_gateways() : array();
 	return isset( $gateways['payram'] ) ? $gateways['payram'] : new WC_Gateway_PayRam();
+}
+
+/**
+ * Refuse a signed webhook that is not about this order's payment: log why,
+ * leave a note on the order for the merchant, change nothing. Answers 200 so
+ * PayRam does not keep redelivering a webhook that can never apply here.
+ */
+function payram_wc_ignore_webhook( $gateway, $order, $reference_id, $reason ) {
+	$gateway->log( 'Webhook ignored for order ' . $order->get_id() . ' (reference ' . $reference_id . '): ' . $reason, 'warning' );
+	$order->add_order_note( sprintf(
+		/* translators: %s: why the update does not apply to this order */
+		__( 'PayRam: a payment update was ignored and this order was not changed. %s', 'payram-woocommerce' ),
+		$reason
+	) );
+	return new WP_REST_Response( array( 'received' => true, 'ignored' => true ), 200 );
+}
+
+/**
+ * Helper: the order PayRam names, by invoice id (= WooCommerce order id),
+ * else by the stored reference id. Used by the buyer return and the webhook.
+ */
+function payram_wc_find_order( $invoice_id, $reference_id ) {
+	$order = '' !== (string) $invoice_id ? wc_get_order( $invoice_id ) : false;
+	if ( ! $order && '' !== (string) $reference_id ) {
+		$order = payram_wc_find_order_by_reference( $reference_id );
+	}
+	return $order;
 }
 
 /** Helper: locate an order by stored PayRam reference id. */
