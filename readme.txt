@@ -33,7 +33,7 @@ hosted crypto checkout, and completes the order when PayRam reports payment.
 
 == Changelog ==
 = 0.3.1 =
-* Security: a webhook can no longer complete an order on its own say. The
+* Security: a webhook can no longer complete an order on its own. The
   plugin re-reads the payment from PayRam (paymentState) before acting, and
   answers 503 when PayRam can't be reached, so PayRam retries instead of the
   order trusting the webhook body.
